@@ -1,7 +1,7 @@
 from __future__ import print_function
 import argparse
 import time
-
+from collections import OrderedDict
 import datetime
 
 import torch
@@ -12,7 +12,10 @@ from utils import init_wandb
 from torchvision import transforms, datasets
 from utils import AverageMeter, accuracy, set_optimizer
 from utils import adjust_learning_rate, warmup_learning_rate, get_learning_rate
-from train import set_model
+
+from models import resnet_BYOL
+
+import torch.backends.cudnn as cudnn 
 
 
 def feature_distance_parser():
@@ -40,7 +43,7 @@ def feature_distance_parser():
     # Optimization
     parser.add_argument('--lr_decay_rate', type=float, default=0.2,
                         help='decay rate for learning rate')
-    parser.add_argument('--learning_rate', type = float, default = 0.05,
+    parser.add_argument('--learning_rate', type = float, default = 0.5,
                         help = 'learning rate')
     parser.add_argument('--momentum', type = float, default = 0.9,
                         help = 'momentum')
@@ -91,14 +94,14 @@ def set_loader(opt):
         normalize,
     ])
 
-    if opt.dataset == 'cifar10':
+    if opt.test_dataset == 'cifar10':
         train_dataset = datasets.CIFAR10(root='./datasets',
                                          transform=train_transform,
                                          download=True)
         val_dataset = datasets.CIFAR10(root='./datasets',
                                        train=False,
                                        transform=val_transform)
-    elif opt.dataset == 'cifar100':
+    elif opt.test_dataset == 'cifar100':
         train_dataset = datasets.CIFAR100(root='./datasets',
                                           transform=train_transform,
                                           download=True)
@@ -106,7 +109,7 @@ def set_loader(opt):
                                         train=False,
                                         transform=val_transform)
     else:
-        raise ValueError(opt.dataset)
+        raise ValueError(opt.test_dataset)
 
     train_sampler = None
     train_loader = torch.utils.data.DataLoader(
@@ -120,24 +123,35 @@ def set_loader(opt):
 
 
 
-def set_model_freeze(opt):
+def set_model_freeze(args):
     
-    model = set_model(opt.model, 10)
+    if args.model[:3] == 'res':
+        model = resnet_BYOL(model_name = args.model,
+                            mode = 'Linear').to(args.device)
+
+    cudnn.benchmark = True
+
     print(model)
     # Load pre-trained encoder
-    state_dict = torch.load(opt.path)['online_encoder_projector']
+    state_dict = torch.load(args.path)['state_dict']
 
-    new_state_dict = {}
+    new_state_dict = OrderedDict()
     for name in state_dict.keys():
-        if not name[:2] == 'fc':
+        if not name[:9] == 'projector':
             new_state_dict[name] = state_dict[name]
 
     print(model.load_state_dict(new_state_dict, strict = False))
 
     # Freeze encoder
     for name, i in model.named_parameters():
-        if not name[:2] == 'fc':
+        if not name[:9] == 'projector':
             i.requires_grad = False
+
+    ###########################################
+    ###########################################
+
+    for params in model.parameters():
+        print(params.requires_grad)
 
     
 

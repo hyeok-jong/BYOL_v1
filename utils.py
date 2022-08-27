@@ -11,9 +11,12 @@ def make_dir(dir):
 
 def set_dir():
     make_dir('./result')
-    dataset_list = ['cifar10', 'cifar100', 'BAPPS', 'stl10']
-    distortions = ['supcon', 'rand', 'v1', 'v2', 'v3']
-    model_list = ['resnet18', 'resnet34', 'resnet50', 'vgg16', 'vgg19']
+    #dataset_list = ['cifar10', 'cifar100', 'BAPPS', 'stl10']
+    dataset_list = ['cifar10', 'BAPPS']
+    #distortions = ['supcon', 'rand']
+    distortions = ['supcon']
+    #model_list = ['resnet18', 'resnet34', 'resnet50', 'vgg16', 'vgg19', 'alex']
+    model_list = ['resnet18', 'resnet50']
     for t in distortions:
         make_dir(f'./result/{t}')
         for d in dataset_list:
@@ -21,11 +24,13 @@ def set_dir():
             for m in model_list:
                 make_dir(f'./result/{t}/{d}/{m}')
 
-def set_optimizer(opt, model):
+
+
+def set_optimizer(args, model):
     optimizer = torch.optim.SGD(model.parameters(),
-                          lr=opt.learning_rate,
-                          momentum=opt.momentum,
-                          weight_decay=opt.weight_decay)
+                          lr=args.learning_rate,
+                          momentum=args.momentum,
+                          weight_decay=args.weight_decay)
     return optimizer
 
 def accuracy(output, target, topk=(1,)):
@@ -61,17 +66,23 @@ def save_model(model, optimizer, args, epoch, save_path):
     print(f'==> Saving {save_path}...')
     state = {
         'args': args,
-        'online_encoder_projector': model.online_encoder_projector.state_dict(),
-        'online_predictor' : model.online_predictor.state_dict(),
-        'target_encoder_projector':model.target_encoder_projector.state_dict(),
+        'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'epoch': epoch,
     }
     torch.save(state, save_path)
     del state
 
-
-
+def save_logs(args, epoch, model, optimizer, loss, lr):
+    path_to_save = f'./result/{args.distortion}/{args.dataset}/{args.model}'
+    if (epoch % args.save_freq == 0) or (epoch<6) or ((epoch == args.epochs)): 
+        save_model(model, optimizer, args, epoch, save_path = f'{path_to_save}/{epoch}.pt')
+    '''
+    with open(f'{path_to_save}/train_loss_{args.batch_size}_{args.size}.txt', 'a', encoding='UTF-8') as f:
+        if epoch == 1:
+            f.write( f'distortion:{args.distortion}  /  dataset:{args.dataset}  /  model:{args.model}  /  batch size:{args.batch_size}  /  input size:{args.size}' + '\n')
+        f.write(f'epoch:{epoch}  /  loss:{round(loss,7)}  /  lr:{round(lr, 7)}' + '\n')
+    '''
 
 def adjust_learning_rate(args, optimizer, epoch):
     lr = args.learning_rate

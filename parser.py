@@ -19,7 +19,7 @@ def BYOL_parser():
     # Optimization
     parser.add_argument('--lr_decay_rate', type=float, default=0.2,
                         help='decay rate for learning rate')
-    parser.add_argument('--learning_rate', type = float, default = 0.01,
+    parser.add_argument('--learning_rate', type = float, default = 0.5,
                         help = 'learning rate')
     parser.add_argument('--momentum', type = float, default = 0.9,
                         help = 'momentum')
@@ -39,12 +39,12 @@ def BYOL_parser():
     parser.add_argument('--dataset', type = str, default = 'cifar10',
                         choices = ['cifar10', 'cifar100', 'BAPPS', 'stl10'], help = 'dataset')
     parser.add_argument('--size', type = int, default = 64, help = 'parameter for RandomResizedCrop')
-    parser.add_argument('--represent_dim', type = int, default = 1024)
-    parser.add_argument('--dim', type = int, default = 1024)
-    parser.add_argument('--projection_size', type = int, default = 1024)
+    parser.add_argument('--prediction_dim', type = int, default = 256)
+    parser.add_argument('--projection_dim', type = int , default = 256)
+    parser.add_argument('--mid_dim', type = int, default = 1024)
     # Custom
     parser.add_argument('--distortion', type = str, default = 'supcon',
-                        help = '[supcon / rand / v1 / v2 / v3]')
+                        help = '[supcon / rand]')
     parser.add_argument('--device', type = str, default = 'cuda:1')
 
     # wandb

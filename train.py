@@ -1,166 +1,138 @@
+from models import resnet_BYOL, MLP
+
 import torch
-import torch.nn as nn
-import torchvision.models as ms
-import copy 
-import time
-import datetime
-import wandb
-from tqdm import tqdm
+import torch.backends.cudnn as cudnn 
+import torch.nn.functional as tnf
+
 import numpy as np
 
-from utils import set_dir, save_model, format_time
-from utils import init_wandb
-from utils import adjust_learning_rate, warmup_learning_rate, get_learning_rate
-from parser import BYOL_parser
+import time
+import datetime
+
+import wandb
+
 from data import set_loader
 
-
-def set_model(name, representation_dim = 128):
-    models = {
-              'resnet18' : ms.resnet18(weights = None, num_classes = representation_dim),
-              'resnet34' : ms.resnet34(weights = None, num_classes = representation_dim),
-              'resnet50' : ms.resnet50(weights = None, num_classes = representation_dim),
-              'vgg16' : ms.vgg16(weights = None, num_classes = representation_dim),
-              'vgg19' : ms.vgg19(weights = None, num_classes = representation_dim)}
-
-    torch.backends.cudnn.benchmark = True
-    return models[name]
-
-def set_predictor(dim = 128, projection_size = 128, hidden_size=128):
-    # Note that size(dim) of projection and prediction should be same
-    return nn.Sequential(
-        nn.Linear(dim, hidden_size),
-        nn.BatchNorm1d(hidden_size),
-        nn.ReLU(inplace=True),
-        nn.Linear(hidden_size, projection_size)
-    )
-
-def set_requires_grad(model, val):
-    for p in model.parameters():
-        p.requires_grad = val
-
-def loss_function(online_prediction, target_projection):
-    x = torch.nn.functional.normalize(online_prediction, dim=-1, p=2)
-    y = torch.nn.functional.normalize(target_projection, dim=-1, p=2)
-    return 2 - 2 * (x * y).sum(dim=-1)
-
-def stop_gradient(model):
-    for p in model.parameters():
-        p.requires_grad = False
-
-class exponential_moving_average():
-    def __init__(self, beta = 0.99):
-        super().__init__()
-        self.beta = beta
-
-    def update_average(self, old, new):
-        if old is None:
-            return new
-        return old * self.beta + (1 - self.beta) * new
-
-def update_target_encoder_projector(ema_updater, target, online):
-    for current_params, ma_params in zip(online.parameters(), target.parameters()):
-        old_weight, up_weight = ma_params.data, current_params.data
-        ma_params.data = ema_updater.update_average(old_weight, up_weight)
+from utils import warmup_learning_rate, get_learning_rate, AverageMeter
+from utils import init_wandb, set_dir, format_time, save_logs
+from utils import adjust_learning_rate
+from parser import BYOL_parser
 
 
-class BYOL(torch.nn.Module):
-    # Class for BYOL 
-    # It's for update target network
-    def __init__(self, args):
-        super().__init__()
 
-        self.online_encoder_projector = set_model(args.model, args.represent_dim)
-        self.target_encoder_projector = copy.deepcopy(self.online_encoder_projector)
-        stop_gradient(self.target_encoder_projector)
-        self.online_predictor = set_predictor(args.dim, args.projection_size, hidden_size=4096)
+def set_encoder_projector(args):
+    # Other models will be able soon
+    if args.model[:3] == 'res':
+        model = resnet_BYOL(
+                            model_name = args.model,
+                            mid_dim = args.mid_dim,
+                            projection_dim = args.projection_dim,
+                            mode = 'BYOL'
+                            ).to(args.device)
+        projection_dim = model.projection_dim
+    cudnn.benchmark = True
+    return model, projection_dim
 
-        self.target_ema_updater = exponential_moving_average(0.99)
+def loss_function(x, y):
+    x = tnf.normalize(x, dim = 1)
+    y = tnf.normalize(y, dim = 1)
+    return 2 - 2 * (x * y).sum(dim = -1)
 
-        self.device = args.device
-    '''
-    def set_target_encoder_projector(self):
-        target_encoder_projector = copy.deepcopy(self.online_encoder_projector)
-        stop_gradient(target_encoder_projector)
-        return target_encoder_projector
-    '''
-    def reset_moving_average(self):
-        del self.target_encoder_projector
-        self.target_encoder_projector = None
+def initialize_target(online, target):
+    for online_params, target_params in zip(online.parameters(), target.parameters()):
+        target_params.data.copy_(online_params)
+        target_params.requires_grad = False
 
-    def update_target(self):
-        update_target_encoder_projector(self.target_ema_updater, self.target_encoder_projector, self.online_encoder_projector)
+def update_target(online, target, moment = 0.99):
+    for online_params, target_params in zip(online.parameters(), target.parameters()):
+        target_params.data = target_params.data * moment + online_params.data * (1. - moment)
+        # if not use .data "RuntimeError: a view of a leaf Variable that requires grad is being used in an in-place operation.""
 
-    def forward(self, images):
-        image1 = images[0].to(self.device)
-        image2 = images[1].to(self.device)
 
-        online_projection_1 = self.online_encoder_projector(image1)
-        online_projection_2 = self.online_encoder_projector(image2)    
+def train(train_loader, online_encoder_projector, online_predictor, target_encoder_projector, optimizer, epoch, args):
+    online_encoder_projector.train()
+    online_predictor.train()
+    target_encoder_projector.train()
+    losses = AverageMeter()
 
-        online_prediction_1 = self.online_predictor(online_projection_1)
-        online_prediction_2 = self.online_predictor(online_projection_2)
+    ''' 1 - epoch training '''
+    for idx, (images, _) in enumerate(train_loader):
+        warmup_learning_rate(args, epoch, idx, len(train_loader), optimizer)
+        image1 = images[0].to(args.device)
+        image2 = images[1].to(args.device)
+
+        batch_size = image1.shape[0]
+
+        online_projection1 = online_encoder_projector(image1)
+        online_projection2 = online_encoder_projector(image2)
+
+        online_prediction1 = online_predictor(online_projection1)
+        online_prediction2 = online_predictor(online_projection2)
 
         with torch.no_grad():
-            #self.target_encoder_projector = self.set_target_encoder_projector()
-            target_projection_1 = self.target_encoder_projector(image1)
-            target_projection_2 = self.target_encoder_projector(image2)
-        
-        loss_1 = loss_function(online_prediction_1, target_projection_1)
-        loss_2 = loss_function(online_prediction_2, target_projection_2)
+            target_projection1 = target_encoder_projector(image1)
+            target_projection2 = target_encoder_projector(image2)
 
-        loss = loss_1 + loss_2
 
-        return loss.mean()
+        loss1 = loss_function(online_prediction1, target_projection1)
+        loss2 = loss_function(online_prediction2, target_projection2)
 
-def train():
+        loss = (loss1 + loss2).mean()
 
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        update_target(online_encoder_projector, target_encoder_projector)
+
+        losses.update(loss.item(), batch_size)
+
+    res = { 'training_loss' : losses.avg, 
+            'learning_rate' : get_learning_rate(optimizer) }
+    return res
+
+def main():
     set_dir()
     args = BYOL_parser()
+
     init_wandb(args)
 
-    trainer = BYOL(args)
-    trainer.to(args.device)
-    trainer.train()
     train_loader = set_loader(args)
 
-    optimizer = torch.optim.Adam(trainer.parameters(), lr=args.learning_rate)
-    # optimizer = torch.optim.Adam(list(trainer.online_encoder_projector.parameters())+ list(trainer.online_predictor.parameters()), lr=args.learning_rate)
+    online_encoder_projector, projection_dim = set_encoder_projector(args)
+    online_predictor = MLP(projection_dim, args.mid_dim, args.prediction_dim)
+    target_encoder_projector, _ = set_encoder_projector(args)
+
+    initialize_target(online_encoder_projector, target_encoder_projector)
+
+    '''    
+    optimizer = torch.optim.SGD(list(online_encoder_projector.parameters())+list(online_predictor.parameters()),
+                                lr = args.learning_rate,
+                                momentum = args.momentum,
+                                weight_decay = args.weight_decay)
+    '''
+    optimizer = torch.optim.Adam(list(online_encoder_projector.parameters())+list(online_predictor.parameters()),
+                                lr = args.learning_rate)
+
+
+    online_encoder_projector.to(args.device)
+    online_predictor.to(args.device)
+    target_encoder_projector.to(args.device)
+
 
     for epoch in range(1, args.epochs + 1):
         adjust_learning_rate(args, optimizer, epoch)
-        training_loss = list()
+
         start_time = time.time()
+        res = train(train_loader, online_encoder_projector, online_predictor, target_encoder_projector, optimizer, epoch, args)
+        loss = res['training_loss']
+        lr = res['learning_rate']
+        print(f'[epoch:{epoch}/{args.epochs}] [loss:{loss}] [lr:{np.round(lr,6)}] [Time:[{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}]] [total time:{format_time(time.time() - start_time)}]')
 
-        # For 1-epoch training
-
-        for idx, (images, _) in tqdm(enumerate(train_loader)):
-            warmup_learning_rate(args, epoch, idx, len(train_loader), optimizer)
-            loss = trainer(images)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            trainer.update_target()
-
-            training_loss.append(loss.cpu().detach().item())
-
-        loss_epoch = np.mean(training_loss)
-        lr = get_learning_rate(optimizer)
-        print(f'[epoch:{epoch}/{args.epochs}] [loss:{np.round(loss_epoch,6)}] [Time:[{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}]] [total time:{format_time(time.time() - start_time)}][lr:{np.round(lr,6)}]')
-        res = {'training loss' : loss_epoch, 'learning rate' : lr}
-
-        wandb.log(res)
-
-        # Save logs
-        path_to_save = f'./result/{args.distortion}/{args.dataset}/{args.model}'
-        if (epoch % args.save_freq == 0) or (epoch<6) or ((epoch == args.epochs)): 
-            save_model(trainer, optimizer, args, epoch, save_path = f'{path_to_save}/{epoch}.pt')
-            
-        with open(f'{path_to_save}/train_loss_{args.batch_size}_{args.size}.txt', 'a', encoding='UTF-8') as f:
-            if epoch == 1:
-                f.write( f'distortion:{args.distortion}  /  dataset:{args.dataset}  /  model:{args.model}  /  batch size:{args.batch_size}  /  input size:{args.size}' + '\n')
-            f.write(f'epoch:{epoch}  /  loss:{round(loss_epoch,7)}  /  lr:{round(lr, 7)}' + '\n')
+        wandb.log(res, step = epoch)
+        save_logs(args, epoch, online_encoder_projector, optimizer, loss, lr)
+        
     wandb.finish()
 
 if __name__ == '__main__':
-    train()
+    main()
